@@ -13,6 +13,8 @@ typedef int16_t file_sample_t; // the sample type as read from the file
 typedef float sample_t; // the external sample type, requested by the calling application
 typedef int file_t;
 
+extern int priorityManagement;
+void currentsStatus();
 namespace ReadSamplesFromDisk{
 // utility functions to open and read files
 // later to be implemented with any audio-specific library of choice
@@ -21,6 +23,9 @@ namespace ReadSamplesFromDisk{
 	}
 	file_t open(char* filename){
 		return ::open(filename, O_RDONLY | O_NONBLOCK);
+	}
+	int close(file_t fd){
+		return ::close(fd);
 	}
 	int read(void* destination, unsigned int requestedLength, file_t fid, unsigned int offset){
 		int ret = ::pread(fid, destination, requestedLength*sizeof(file_sample_t), offset*sizeof(file_sample_t));
@@ -51,6 +56,9 @@ namespace  SampleBuffer{
 		}
 	}
 };
+
+int underrunCounter = 0;
+int totalCalls = 0;
 
 class ReadFileVoice {
 public:
@@ -94,18 +102,22 @@ public:
 		writtenSamples_ = 0;
 		isPlaying_ = true;
 		loadCompleted_ = false;
+		startedReading_ = false;
 	}
 	void stopPlaying(){
 		isPlaying_ = false;
 	}
 	int getSamplesAdd(float *destination, unsigned int size, int step){ //REALTIME
+		startedReading_ = true;
+		totalCalls++;
 		assert(readPointer_ < bufferSize_);
 		assert(readPointer_ >= 0);
 		if(getActualNumberOfBufferedSamples() < (int)size && loadCompleted_ == false){
-			rt_printf("\nbuffer underrun\n");
+			rt_printf("buffer underrun %d readSamples %d, writtenSamples %d; %f%% \n", underrunCounter, readSamples_, writtenSamples_, underrunCounter*100/(float)totalCalls);
+			currentsStatus();
+			underrunCounter++;
 		}
 		size = std::min((int)size, writtenSamples_ - readSamples_);
-		//TODO: add here to find end of file
 		int readFromCurrentReadPointer = std::min((bufferSize_ - readPointer_), (int)size);
 		int readFromBeginning = size - readFromCurrentReadPointer;
 		if(readFromCurrentReadPointer > 0){
@@ -123,22 +135,94 @@ public:
 			readPointer_ -= bufferSize_;
 		}
 		readSamples_ += readFromCurrentReadPointer + readFromBeginning;
+		if(loadCompleted_ && readSamples_ >= writtenSamples_){
+			// TODO: this will allow you to read past the end of the buffer
+			isPlaying_ = false;
+		}
 		return readFromCurrentReadPointer + readFromBeginning;
 	}
 	int getActualNumberOfBufferedSamples(){
 		return (bufferSize_ + writePointer_ - readPointer_) % bufferSize_;
 	}
-
+	bool startedReading_;
 protected:
 	static AuxiliaryTask readingFileTask_;
 	static bool staticConstructed_;
 	static void readingFileTask(){
 		printf("readingFileTask\n");
-		while(!gShouldStop){
-			for(unsigned int n = 0; n < instances_.size(); ++n){
-				instances_[n]->loadNextBlock();
+		if(priorityManagement == 1){
+			while(!gShouldStop){
+				unsigned int minSamples = 10000000;
+				unsigned int minIndex = instances_.size();
+				for(unsigned int n = 0; n < instances_.size(); ++n){
+					ReadFileVoice* that = instances_[n];
+					if(that->loadCompleted_ || !that->isPlaying_){
+						continue;
+					}
+					unsigned int samples = that->getActualNumberOfBufferedSamples();
+					if(samples < minSamples){
+						minSamples = samples;
+						minIndex = n;
+					}
+				}
+				if(minIndex == instances_.size()){
+					// nothing is reading at the moment
+					usleep(1000);
+					continue;
+				}
+				instances_[minIndex]->loadNextBlock();
+				if(minSamples > blockSize_ && minSamples <= 2*blockSize_){
+					usleep(10);
+				} else if(minSamples > 2*blockSize_ && minSamples <= 4*blockSize_){
+					usleep(100);
+				} else if(minSamples > 4*blockSize_){
+					usleep(1000);
+				}
 			}
-			usleep(2000);
+		} else if (priorityManagement == 2){
+			std::vector<ReadFileVoice*> highPriority;
+			unsigned int maxCount = 20;
+			highPriority.assign(maxCount, (ReadFileVoice*)0);
+			while(!gShouldStop){
+				unsigned int count = 0;
+				unsigned int limit = blockSize_/4;
+				unsigned int maxLimit = 8*blockSize_;
+				int start = 0;
+				while(count < maxCount){
+					start = count;
+					for(unsigned int n = 0; n < instances_.size(); ++n){
+						ReadFileVoice* that = instances_[n];
+						if(that->loadCompleted_ || !that->isPlaying_){
+							continue;
+						}
+						unsigned int samples = that->getActualNumberOfBufferedSamples();
+						if(samples < limit){
+							highPriority[count] = that;
+							++count;
+						}
+						if(count == maxCount)
+							break;
+					}
+					for(unsigned int n = start; n < count; ++n){
+						if(highPriority[n] != NULL){
+							highPriority[n]->loadNextBlock();
+						}
+					}
+					limit *= 2;
+					if(limit > maxLimit){
+						break;
+						break;
+					}
+				}
+				usleep(100);
+			}
+		}else if (priorityManagement == 0) { // no priorityManagement
+			while(!gShouldStop){
+				for(unsigned int n = 0; n < instances_.size(); ++n){
+					instances_[n]->loadNextBlock();
+				}
+				usleep(100);
+			}
 		}
 	}
 	void staticConstructor(){
@@ -232,6 +316,9 @@ public:
 		init(preloadSize, blockSize, bufferSize, maxNumFiles, numVoices);
 	}
 	~PlayFile(){
+		for(unsigned int n = 0; n < audioFiles_.size(); ++n){
+			ReadSamplesFromDisk::close(audioFiles_[n]->fd);
+		}
 		deallocate();
 	}
 
@@ -239,7 +326,7 @@ public:
 		audioFilesPointer_ = 0;
 		preloadSize_ = preloadSize;
 		blockSize_ = blockSize;
-		preloadBuffer_ = new file_sample_t[preloadSize_];
+		preloadTempBuffer_ = new file_sample_t[preloadSize_];
 		// allocate the voices that will read from disk upon request.
 		voices_.reserve(numVoices);
 		for(int n = 0; n < numVoices; ++n){
@@ -266,7 +353,8 @@ public:
 		AudioFile* audioFile = audioFiles_[audioFilesPointer_];
         audioFile->fd = fd;
         //load offset samples into the head
-        ReadSamplesFromDisk::readConvert(audioFile->head, preloadBuffer_, preloadSize_, fd, 0);
+        ReadSamplesFromDisk::readConvert(audioFile->head, preloadTempBuffer_, preloadSize_, fd, 0);
+        //TODO: check if file is empty
         //returns the associated file number, to be used to refer to this file in the future
 		return audioFilesPointer_++;
 	}
@@ -326,7 +414,6 @@ public:
     	if(readFromHead > 0){ // read from head buffer
     		SampleBuffer::add(&(audioFiles_[voice->fileNumber]->head[fileReadPointer]), destination, readFromHead, step);
     		ret += size;
-//    		rt_printf(".");
     	}
     	if(readFromVoice > 0){ // read from readFileVoice
     		ret += voice->readFileVoice->getSamplesAdd(destination+(readFromHead*step), readFromVoice, step);
@@ -342,20 +429,29 @@ public:
     void checkStatus(){
     	int min = 1000000000;
     	int max = 0;
+    	int tot = 0;
+    	int count = 0;
     	for(unsigned int n = 0; n < voices_.size(); ++n){
-    		int num = voices_[n]->readFileVoice->getActualNumberOfBufferedSamples();
+    		Voice* voice = voices_[n];
+    		if(voice->fileNumber == -1)
+    			continue;
+    		int num = voice->readFileVoice->getActualNumberOfBufferedSamples();
     		min = std::min(min, num);
     		max = std::max(max, num);
+    		tot += num;
+    		count++;
+    		if(!(voice->readFileVoice->startedReading_))
+    			rt_printf("*");
+    		rt_printf("%d ", num);
     	}
-    	rt_printf("Buffered samples: min %d, max %d\n", min, max);
+    	rt_printf("\nBuffered samples: min %d, max %d, mean %f, voices: %d, totalSamples: %d\n", min, max, tot/(float)count, count, tot);
     }
 private:
     DISALLOW_COPY_AND_ASSIGN(PlayFile);
 	void allocate(){
-//		buffer_ = new file_sample_t[preloadSize_];
 	}
 	void deallocate(){
-		delete[] preloadBuffer_;
+		delete[] preloadTempBuffer_;
 		for(unsigned int n = 0; n < voices_.size(); ++n){
 			delete voices_[n];
 		}
@@ -365,7 +461,7 @@ private:
 	}
 	unsigned int blockSize_;
 	unsigned int preloadSize_;
-	file_sample_t* preloadBuffer_;
+	file_sample_t* preloadTempBuffer_;
 	std::vector<Voice*> voices_;
 	std::vector<AudioFile*> audioFiles_;
 	unsigned int audioFilesPointer_;
